@@ -15,6 +15,9 @@
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
 #include <stdio.h>
+#include <map>
+#include <mutex>
+#include <iostream>
 
 #include "cuda.h"
 
@@ -61,15 +64,59 @@ public:
   ~ScopedContext() { CUDA_REPORT_IF_ERROR(cuCtxPopCurrent(nullptr)); }
 };
 
+class GPUModuleCache {
+  GPUModuleCache() { }
+  std::map<void*, CUmodule> m_modules;
+  std::mutex m_lock;
+
+public:
+  static GPUModuleCache &getInstance() {
+    static GPUModuleCache instance;
+    return instance;
+  }
+
+  CUmodule getModule(void *data) {
+    // Acquire lock
+    std::lock_guard<std::mutex> lock(m_lock);
+    auto it = m_modules.find(data);
+    if (it != m_modules.end()) {
+      // std::cout << "Found module in cache: " << data << "\n";
+      return it->second;
+    }
+
+    ScopedContext scopedContext;
+    CUmodule module = nullptr;
+    CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, data));
+    m_modules[data] = module;
+    // std::cout << "Added module to cache: " << data << "\n";
+    return module;
+  }
+
+  void clearCache() {
+    // Acquire lock
+    std::lock_guard<std::mutex> lock(m_lock);
+    for (auto &it : m_modules) {
+      CUDA_REPORT_IF_ERROR(cuModuleUnload(it.second));
+    }
+    m_modules.clear();
+  }  
+};
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuClearModuleCache() {
+  // std::cout << "Clearing GPU module cache\n";
+  GPUModuleCache::getInstance().clearCache();
+}
+
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT CUmodule mgpuModuleLoad(void *data) {
-  ScopedContext scopedContext;
-  CUmodule module = nullptr;
-  CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, data));
-  return module;
+  // ScopedContext scopedContext;
+  // CUmodule module = nullptr;
+  // CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, data));
+  // return module;
+  return GPUModuleCache::getInstance().getModule(data);
 }
 
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuModuleUnload(CUmodule module) {
-  CUDA_REPORT_IF_ERROR(cuModuleUnload(module));
+  // CUDA_REPORT_IF_ERROR(cuModuleUnload(module));
 }
 
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT CUfunction
