@@ -14,6 +14,8 @@
 
 #include <cassert>
 #include <numeric>
+#include <map>
+#include <mutex>
 
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -32,20 +34,95 @@
 
 thread_local static int32_t defaultDevice = 0;
 
+class GPUModuleCache {
+  GPUModuleCache() { }
+  std::map<void*, hipModule_t> m_modules;
+  std::map<hipModule_t, std::map<std::string, hipFunction_t> > m_functionAddresses;
+  std::mutex m_lock;
+  hipStream_t m_stream = nullptr;
+
+public:
+  static GPUModuleCache &getInstance() {
+    static GPUModuleCache instance;
+    return instance;
+  }
+
+  hipModule_t getModule(void *data) {
+    // Acquire lock
+    std::lock_guard<std::mutex> lock(m_lock);
+    auto it = m_modules.find(data);
+    if (it != m_modules.end()) {
+      // std::cout << "Found module in cache: " << data << "\n";
+      return it->second;
+    }
+
+    hipModule_t module = nullptr;
+    HIP_REPORT_IF_ERROR(hipModuleLoadData(&module, data));
+    m_modules[data] = module;
+    // std::cout << "Added module to cache: " << data << "\n";
+    return module;
+  }
+
+  hipFunction_t getFunctionAddr(hipModule_t module, const std::string& kernelName) {
+    // Acquire lock
+    std::lock_guard<std::mutex> lock(m_lock);    
+    auto& moduleMap = m_functionAddresses[module];
+    auto iter = moduleMap.find(kernelName);
+    if (iter == moduleMap.end()) {
+      hipFunction_t function = nullptr;
+      HIP_REPORT_IF_ERROR(hipModuleGetFunction(&function, module, kernelName.c_str()));
+      moduleMap[kernelName] = function;
+      iter = moduleMap.find(kernelName);
+    }
+    assert (iter != moduleMap.end());
+    return iter->second;
+  }
+
+  void clearCache() {
+    // Acquire lock
+    std::lock_guard<std::mutex> lock(m_lock);
+    for (auto &it : m_modules) {
+      HIP_REPORT_IF_ERROR(hipModuleUnload(it.second));
+    }
+    m_modules.clear();
+    m_functionAddresses.clear();
+
+    if (m_stream) {
+      HIP_REPORT_IF_ERROR(hipStreamDestroy(m_stream));
+      m_stream = nullptr;
+    }
+  }
+
+  hipStream_t getStream() {
+    // Acquire lock
+    std::lock_guard<std::mutex> lock(m_lock);    
+    if (m_stream == nullptr) {
+      HIP_REPORT_IF_ERROR(hipStreamCreate(&m_stream));
+    }
+    return m_stream;
+  }
+};
+
+extern "C" void mgpuClearModuleCache() {
+  // std::cout << "Clearing GPU module cache\n";
+  GPUModuleCache::getInstance().clearCache();
+}
+
 extern "C" hipModule_t mgpuModuleLoad(void *data) {
-  hipModule_t module = nullptr;
-  HIP_REPORT_IF_ERROR(hipModuleLoadData(&module, data));
+  hipModule_t module = GPUModuleCache::getInstance().getModule(data);
+  // HIP_REPORT_IF_ERROR(hipModuleLoadData(&module, data));
   return module;
 }
 
 extern "C" void mgpuModuleUnload(hipModule_t module) {
-  HIP_REPORT_IF_ERROR(hipModuleUnload(module));
+  // HIP_REPORT_IF_ERROR(hipModuleUnload(module));
 }
 
 extern "C" hipFunction_t mgpuModuleGetFunction(hipModule_t module,
                                                const char *name) {
-  hipFunction_t function = nullptr;
-  HIP_REPORT_IF_ERROR(hipModuleGetFunction(&function, module, name));
+  // hipFunction_t function = nullptr;
+  // HIP_REPORT_IF_ERROR(hipModuleGetFunction(&function, module, name));
+  hipFunction_t function = GPUModuleCache::getInstance().getFunctionAddr(module, name);
   return function;
 }
 
@@ -64,13 +141,14 @@ extern "C" void mgpuLaunchKernel(hipFunction_t function, intptr_t gridX,
 }
 
 extern "C" hipStream_t mgpuStreamCreate() {
-  hipStream_t stream = nullptr;
-  HIP_REPORT_IF_ERROR(hipStreamCreate(&stream));
-  return stream;
+  // hipStream_t stream = nullptr;
+  // HIP_REPORT_IF_ERROR(hipStreamCreate(&stream));
+  // return stream;
+  return GPUModuleCache::getInstance().getStream();
 }
 
 extern "C" void mgpuStreamDestroy(hipStream_t stream) {
-  HIP_REPORT_IF_ERROR(hipStreamDestroy(stream));
+  // HIP_REPORT_IF_ERROR(hipStreamDestroy(stream));
 }
 
 extern "C" void mgpuStreamSynchronize(hipStream_t stream) {
